@@ -1,138 +1,168 @@
-# DynamicConvolutionOperator
+# Dynamic Convolution Operator
 
-本项目致力于通过 OpenAI Triton 深度优化(ECCV 2020) Hierarchical Dynamic Filtering Network for RGB-D Salient Object Detection 中 Dynamic Dilated Pyramid Module 核心模块的性能瓶颈。
+这是 ECCV 2020 HD²F-Net 中 Dynamic Dilated Pyramid Module（DDPM）的优化实现。
+`unfold_impl.py` 是数学参考，`triton_impl.py` 是 CPU/CUDA 自适应实现，
+`_triton_kernels.py` 包含 Triton kernel。
 
-## 🎯 优化分析
+## 问题与目标
 
-在传统方案中（见 `unfold_impl.py`），如果我们需要对一个提取到深层的 Feature Map 执行不同膨胀率的局部截取与运算（例如 `Dilation=1, 3, 5` 的融合网络），常见实现依赖 `nn.Unfold` 将特征切面全量缓存进行提取。这种方案在深层会面临如下问题：
-1. 庞大的内存：例如当我们选定 `Kernel Size = 5`，特征图会被 `nn.Unfold` 强制在内存中膨胀 $25\times$ 的体积。在大批量和稍微增大的分辨率下，可以轻易突破 10GB~20GB 从而把整个工作站的物理显存撑爆。
-2. 多分支数据搬运：不同 Dilation 分支运算结束后，我们通常要强行用 `torch.cat` 去完成所有算链的汇总。这使得极其珍贵的片上内存又被反复读写搬迁。
+参考实现会同时产生两个大中间量：
 
-## 💡 解决方案
+1. 三个 `Unfold(x)`：约 `3 * N * C * K² * H * W`；
+2. 1×1 生成器输出的动态核：`N * 3 * C * K² * H * W`。
 
-在 `triton_impl.py` 中弃用 PyTorch 自带接口，直接使用基于 Triton 的并行方案。单线程 Block 同时拉起并承载 `Dilation=1, 3, 5` 这三个不同感受野的独立采集、坐标计算与点乘求和。并将最后运算获得的不同深度的像素，通过底层跨步指针重写（`tl.store` 加上严格对齐的步长偏移），直接送给下级聚合算子。这直接消除了那些25倍膨胀产生的中间矩阵所调用的内存读写。
+这既增加显存流量，也让训练保存动态核及其梯度。优化实现借鉴
+FlashAttention/NATTEN 的 producer-consumer 融合、反向重计算和分块归约，但保留普通动态
+depthwise 卷积的数学定义，不引入 neighborhood attention 的特殊语义。
 
-## 🚀 性能评估
+## 实现设计
 
-我们写了验证比对框架，支持所有矩阵维度的排列组合遍历计算。
+### CUDA 动态过滤
 
-```bash
-# 执行如下自动化扫描脚本即可跑完所有矩阵组合，并支持检验浮点反推梯度的正确性
-python bench.py --backward
+已生成动态核时，单个 Triton kernel 同时处理 dilation `(1, 3, 5)`，不再执行 `Unfold`。
+前向按空间 tile 读取邻域，FP32 累加后直接写出 `[x, d1, d3, d5]`。反向分别融合 `dX`
+和 `dK`，避免构造补丁矩阵。tile 和 warp 数按 `(C,H,W,K)` 首次自动调优。
+
+### CUDA 融合生成器推理
+
+无梯度、未开启 autocast 且输入与参数 dtype 相同时，1×1 kernel 生成器和动态过滤在同一
+`channel tile × spatial tile` 中完成：
+
+```text
+y tile -> tl.dot(weight, y) -> dynamic taps -> consume with shifted x -> output
 ```
 
-在执行中部分维度的横向与纵深吞吐，Triton 方案平均实现了相比 PyTorch Native 的 **约 2倍** 速率提升：
+动态核只存在于寄存器/片上临时值中，不写入全局显存。最后的 3×3 `fuse` 卷积继续交给
+cuDNN；将其并入前一个 kernel 会让动态过滤结果在输出通道 tile 间重复计算，得不偿失。
 
-| Batch | Kernel |  Dim | Res  | AMP    |    Impl | Mean Time (ms) | Peak Mem (MB) | Aligned |
-| ----: | -----: | ---: | :--- | :----- | ------: | -------------: | :------------ | :------ |
-|     1 |     64 |  128 | none | triton | 1.07604 |        83.1743 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | none | unfold | 1.23796 |        95.1743 | ✓对齐         | 0.87x   |
-|     1 |     64 |  128 | fp16 | triton | 1.55533 |         153.27 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | fp16 | unfold | 2.42349 |         153.27 | ✓对齐         | 0.64x   |
-|     1 |     64 |  128 | bf16 | triton | 1.80216 |        153.269 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | bf16 | unfold | 2.34165 |        153.269 | ✓对齐         | 0.77x   |
-|     1 |     64 |  256 | none | triton | 2.26978 |        323.425 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | none | unfold | 2.80636 |        371.425 | ✓对齐         | 0.81x   |
-|     1 |     64 |  256 | fp16 | triton | 1.65957 |        265.199 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | fp16 | unfold | 2.20246 |        313.199 | ✓对齐         | 0.75x   |
-|     1 |     64 |  256 | bf16 | triton |  1.6835 |        265.198 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | bf16 | unfold |  2.1826 |        313.198 | ✓对齐         | 0.77x   |
-|     1 |     64 |  128 | none | triton | 1.58221 |        249.556 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | none | unfold | 2.67495 |        321.556 | ✓对齐         | 0.59x   |
-|     1 |     64 |  128 | fp16 | triton | 1.46708 |        303.768 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | fp16 | unfold | 2.04344 |        281.768 | ✓对齐         | 0.72x   |
-|     1 |     64 |  128 | bf16 | triton | 1.42362 |        303.767 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | bf16 | unfold | 2.01173 |        281.767 | ✓对齐         | 0.71x   |
-|     1 |     64 |  256 | none | triton | 6.66185 |        993.556 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | none | unfold |  12.026 |        1281.56 | ✓对齐         | 0.55x   |
-|     1 |     64 |  256 | fp16 | triton | 5.99051 |        1209.77 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | fp16 | unfold | 9.73161 |        1121.77 | ✓对齐         | 0.62x   |
-|     1 |     64 |  256 | bf16 | triton | 5.99144 |        1209.77 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | bf16 | unfold | 9.69384 |        1121.77 | ✓对齐         | 0.62x   |
-|     1 |     64 |  128 | none | triton | 3.66603 |        634.317 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | none | unfold | 7.36078 |        834.317 | ✓对齐         | 0.50x   |
-|     1 |     64 |  128 | fp16 | triton | 3.56193 |        785.732 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | fp16 | unfold |  6.0926 |        730.904 | ✓对齐         | 0.58x   |
-|     1 |     64 |  128 | bf16 | triton | 3.56308 |        785.731 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  128 | bf16 | unfold | 6.08826 |        730.903 | ✓对齐         | 0.59x   |
-|     1 |     64 |  256 | none | triton | 14.4004 |        2531.15 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | none | unfold | 29.2564 |        3331.15 | ✓对齐         | 0.49x   |
-|     1 |     64 |  256 | fp16 | triton | 13.9935 |         3130.9 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | fp16 | unfold | 24.1352 |         2914.9 | ✓对齐         | 0.58x   |
-|     1 |     64 |  256 | bf16 | triton |  13.971 |         3130.9 | 参考(Ref)     | 1.00x   |
-|     1 |     64 |  256 | bf16 | unfold | 24.1342 |         2914.9 | ✓对齐         | 0.58x   |
-|     2 |     64 |  128 | none | triton | 1.27239 |        193.175 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | none | unfold | 1.73402 |        193.175 | ✓对齐         | 0.73x   |
-|     2 |     64 |  128 | fp16 | triton | 1.24348 |        177.316 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | fp16 | unfold | 2.05371 |        177.316 | ✓对齐         | 0.61x   |
-|     2 |     64 |  128 | bf16 | triton | 1.69059 |        177.315 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | bf16 | unfold | 2.29611 |        177.315 | ✓对齐         | 0.74x   |
-|     2 |     64 |  256 | none | triton | 5.20902 |        643.425 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | none | unfold | 6.81913 |        739.425 | ✓对齐         | 0.76x   |
-|     2 |     64 |  256 | fp16 | triton |  3.7009 |        529.199 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | fp16 | unfold | 4.96051 |        625.199 | ✓对齐         | 0.75x   |
-|     2 |     64 |  256 | bf16 | triton | 3.78571 |        529.198 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | bf16 | unfold | 5.02962 |        625.198 | ✓对齐         | 0.75x   |
-|     2 |     64 |  128 | none | triton | 3.20137 |        497.556 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | none | unfold | 5.74176 |        641.556 | ✓对齐         | 0.56x   |
-|     2 |     64 |  128 | fp16 | triton | 2.98321 |        605.768 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | fp16 | unfold | 4.69186 |        561.768 | ✓对齐         | 0.64x   |
-|     2 |     64 |  128 | bf16 | triton | 2.93801 |        605.767 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | bf16 | unfold | 4.69902 |        561.767 | ✓对齐         | 0.63x   |
-|     2 |     64 |  256 | none | triton | 12.6582 |        1985.56 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | none | unfold | 23.5228 |        2561.56 | ✓对齐         | 0.54x   |
-|     2 |     64 |  256 | fp16 | triton | 11.7618 |        2417.77 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | fp16 | unfold | 19.2712 |        2241.77 | ✓对齐         | 0.61x   |
-|     2 |     64 |  256 | bf16 | triton | 11.7394 |        2417.77 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | bf16 | unfold | 19.2795 |        2241.77 | ✓对齐         | 0.61x   |
-|     2 |     64 |  128 | none | triton | 7.21617 |        1266.32 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | none | unfold | 14.7464 |        1666.32 | ✓对齐         | 0.49x   |
-|     2 |     64 |  128 | fp16 | triton | 7.06767 |         1566.9 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | fp16 | unfold | 12.2673 |         1458.9 | ✓对齐         | 0.58x   |
-|     2 |     64 |  128 | bf16 | triton | 7.04598 |         1566.9 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  128 | bf16 | unfold |  12.274 |         1458.9 | ✓对齐         | 0.57x   |
-|     2 |     64 |  256 | none | triton | 28.8071 |        5059.15 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | none | unfold |  58.382 |        6659.15 | ✓对齐         | 0.49x   |
-|     2 |     64 |  256 | fp16 | triton | 28.1097 |         6258.9 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | fp16 | unfold | 48.2942 |         5826.9 | ✓对齐         | 0.58x   |
-|     2 |     64 |  256 | bf16 | triton | 28.1075 |         6258.9 | 参考(Ref)     | 1.00x   |
-|     2 |     64 |  256 | bf16 | unfold | 48.2801 |         5826.9 | ✓对齐         | 0.58x   |
-|     4 |     64 |  128 | none | triton | 2.33753 |        323.174 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | none | unfold |  3.0506 |        371.174 | ✓对齐         | 0.77x   |
-|     4 |     64 |  128 | fp16 | triton | 1.69218 |        265.199 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | fp16 | unfold | 2.29615 |        313.199 | ✓对齐         | 0.74x   |
-|     4 |     64 |  128 | bf16 | triton | 1.91026 |        265.198 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | bf16 | unfold | 2.64404 |        313.198 | ✓对齐         | 0.72x   |
-|     4 |     64 |  256 | none | triton | 9.80572 |        1283.17 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | none | unfold | 13.6664 |        1475.17 | ✓对齐         | 0.72x   |
-|     4 |     64 |  256 | fp16 | triton | 7.40646 |         1057.2 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | fp16 | unfold |  10.523 |         1249.2 | ✓对齐         | 0.70x   |
-|     4 |     64 |  256 | bf16 | triton |  7.4664 |         1057.2 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | bf16 | unfold | 10.5942 |         1249.2 | ✓对齐         | 0.70x   |
-|     4 |     64 |  128 | none | triton | 6.41024 |        993.556 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | none | unfold | 11.8664 |        1281.56 | ✓对齐         | 0.54x   |
-|     4 |     64 |  128 | fp16 | triton | 5.84712 |        1209.77 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | fp16 | unfold | 9.63093 |        1121.77 | ✓对齐         | 0.61x   |
-|     4 |     64 |  128 | bf16 | triton | 5.85482 |        1209.77 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | bf16 | unfold | 9.62217 |        1121.77 | ✓对齐         | 0.61x   |
-|     4 |     64 |  256 | none | triton | 25.4249 |        3969.56 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | none | unfold |  47.263 |        5121.56 | ✓对齐         | 0.54x   |
-|     4 |     64 |  256 | fp16 | triton | 23.5271 |        4833.77 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | fp16 | unfold |  38.714 |        4481.77 | ✓对齐         | 0.61x   |
-|     4 |     64 |  256 | bf16 | triton | 23.5103 |        4833.77 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | bf16 | unfold | 38.6848 |        4481.77 | ✓对齐         | 0.61x   |
-|     4 |     64 |  128 | none | triton | 14.6556 |        2530.32 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | none | unfold | 29.7304 |        3330.32 | ✓对齐         | 0.49x   |
-|     4 |     64 |  128 | fp16 | triton | 14.1473 |         3130.9 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | fp16 | unfold | 24.5036 |         2914.9 | ✓对齐         | 0.58x   |
-|     4 |     64 |  128 | bf16 | triton | 14.0807 |        3131.73 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  128 | bf16 | unfold | 24.4947 |         2914.9 | ✓对齐         | 0.57x   |
-|     4 |     64 |  256 | none | triton | 59.5633 |        10114.3 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | none | unfold | 118.181 |        13314.3 | ✓对齐         | 0.50x   |
-|     4 |     64 |  256 | fp16 | triton | 57.2382 |        12514.9 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | fp16 | unfold | 97.0677 |        11650.9 | ✓对齐         | 0.59x   |
-|     4 |     64 |  256 | bf16 | triton | 57.1962 |        12514.9 | 参考(Ref)     | 1.00x   |
-|     4 |     64 |  256 | bf16 | unfold | 97.0336 |        11651.7 | ✓对齐         | 0.59x   |
+### CUDA Flash 式融合训练
+
+`K<=3` 时提供不保存 `K`、不构造 `dK` 的自定义 autograd：
+
+- forward：与融合推理相同，生成后立即消费；
+- `dX`：反向重算动态 tap，并 gather 各 dilation 的贡献；
+- `dY`：片上形成 `dK = shifted(x) * grad`，立即与生成器权重相乘；
+- `dWeight/dbias`：片上形成 `dK`，执行空间归约。小尺寸直接写回；大尺寸把 token 切成
+  最多 16 个 FP32 partial，再用第二个短 kernel 归约。这解决了单 CTA 串行扫描全部像素的
+  扩展瓶颈，只需数 MiB workspace，而不是数百 MiB 动态核。
+
+FP32 前向使用 IEEE dot，以守住推理误差阈值；FP32 大尺寸反向归约和重计算使用 TF32
+Tensor Core，所有归约保持 FP32 accumulator。BF16 在写出动态 tap 前显式量化，匹配
+PyTorch 生成器的 dtype 语义。
+
+`fused_generator_training=None` 是默认自动模式：
+
+- 空间 token `N*H*W > 16384`：融合训练；
+- 恰好 `16384`：FP32 融合，BF16 物化；
+- 更小尺寸、`K>3`、autocast 或 dtype 不匹配：生成器由 PyTorch/cuDNN 执行，再调用融合
+  动态过滤。
+
+可传 `True` 强制低显存融合训练，或传 `False` 强制物化路径。
+
+### CPU 与超大输入
+
+- CPU 常规尺寸：动态核不超过默认 256 MiB 时保留高效 1×1 GEMM；推理用 padding +
+  shifted view 代替 `Unfold`，训练使用 oneDNN 友好的路径。
+- 超过预算：按空间 token 流式生成/消费；训练可用 checkpoint 重算 tile。临时动态核从
+  `O(NHW * 3CK²)` 降为 `O(NT * 3CK²)`，默认 `T=4096`。
+- CPU-only 环境无需安装 Triton；CUDA 张量第一次进入模块时才延迟导入。
+
+## 使用
+
+接口与参考实现兼容：
+
+```python
+from triton_impl import DDPM
+
+module = DDPM(dim=64, kernel_size=3)
+output = module(x, y)
+```
+
+完整参数：
+
+```python
+module = DDPM(
+    dim=64,
+    kernel_size=3,
+    spatial_tile_size=4096,
+    max_generated_bytes=256 * 1024**2,
+    recompute=True,
+    fused_generator_inference=True,
+    fused_generator_training=None,  # None=自动，True=强制融合，False=物化
+)
+```
+
+## 验证与基准
+
+CPU（`ptcoding`）：
+
+```powershell
+conda run -n ptcoding python -m unittest -v test_triton_impl.py
+conda run -n ptcoding python bench.py --device cpu --dim 32 --resolution 48 --warmup 3 --repeats 20
+conda run -n ptcoding python bench.py --device cpu --dim 32 --resolution 32 --backward
+```
+
+GPU：
+
+```bash
+python gpu_validate.py
+python gpu_bench.py --quick --training --warmup 20 --repeats 100
+python gpu_bench.py --only-r256 --training --warmup 15 --repeats 50
+python gpu_memory_bench.py --implementation fused --dtype float32 --resolution 256
+python plot_performance.py
+```
+
+GPU 回归覆盖：
+
+- `K=1/3/5`；
+- `B=2, C=24, H=15, W=17`，覆盖非 2 次幂通道、mask、非方形边界和跨 tile 邻域；
+- 显式 FP32/BF16 融合训练；
+- 输出、`x/y` 梯度、generator/fuse 全部参数梯度；
+- 物化 Triton、融合 Triton 与 Unfold 三路比较。
+
+最终验证环境为 RTX 5090、PyTorch `2.8.0+cu128`、CUDA 12.8、Triton 3.4.0。
+完整矩阵开始时 GPU 为 `0%`、`0 MiB`。所有正确性检查通过。`K=3` FP32 融合训练在
+`C=24` 非对齐回归中的输出最大绝对误差为 `9.43e-5`；BF16 为 `1.5625e-2`。
+
+## RTX 5090 结果
+
+以下为热身后的 CUDA event 稳态结果，主要尺寸是 `B=1, C=64, K=3`。横轴依次表示
+Unfold 基线、仅替换动态过滤，以及进一步融合 generator；纵轴是相对 Unfold 的端到端
+加速比。训练面板展示强制融合路径，128² BF16 的默认自动模式会选择更快的物化结果。
+
+![不同改造阶段的 DDPM 端到端性能提升](performance_progression.svg)
+
+动态过滤前向在 128² FP32/BF16 下分别达到 3.79×/5.03×，保守有效带宽下界为
+1.766/1.790 TB/s，已接近该卡的显存带宽上界；256² 下分别达到 4.72×/5.78×。
+`K=5, 128²` 的动态过滤加速为 FP32 4.74×、BF16 3.60×。
+
+完整推理在 128² 达到 FP32 2.78×、BF16 3.72×，在 256² 达到 FP32 3.73×、
+BF16 5.23×。FP32 128² 最大绝对误差为 `1.894e-3`、RMSE `3.260e-4`；
+BF16 最大绝对误差为 `2.344e-2`、RMSE `3.729e-3`。`K=5, 128²` 完整推理另测为
+FP32 4.13×、BF16 4.42×。
+
+完整训练的默认自动路径在 128² 达到 FP32 1.18×、BF16 1.06×，在 256² 达到
+FP32 2.16×、BF16 2.78×。大尺寸融合相对物化 Triton 再快 3.9%（FP32）和
+23.6%（BF16）；剩余时间主要属于最后的 cuDNN 3×3 卷积及其反向。
+
+隔离进程测得，强制融合训练相对 Unfold 的临时峰值显存减少 72.6%～81.5%，相对物化
+Triton 减少 64.3%～75.8%。其中 256² FP32 从 1232.6 MiB 降至 326.8 MiB，
+256² BF16 从 616.3 MiB 降至 114.3 MiB。
+
+## 已验证但未采用的方案
+
+- 扩大融合生成器 autotune 搜索到 `BLOCK_C=16/32 × BLOCK_HW=64/128`：大尺寸配置未胜出，
+  会显著增加首次编译时间。
+- `torch.compile(mode="reduce-overhead")`：独立动态训练反而变慢；整个模块最多约 1.12×，
+  不适合作为默认路径。
+- `tf32x3`：精度通过，但在 RTX 5090/Triton 3.4 上没有速度收益。
+- 前向原生 TF32：R256 推理可到约 0.598 ms，但最大误差 `4.04e-3` 超过既定
+  `2e-3` 阈值，因此只在反向使用 TF32。
+- 单 CTA 扫完整个 R256 空间：`dWeight` 单 kernel 达 2.63 ms；split-reduction 将
+  R256 FP32 整体融合训练从 6.03 ms 降至 3.66 ms。
+
+首次遇到新 `(C,H,W,K,dtype)` 会产生 Triton JIT/autotune 冷启动；表中不包含编译时间。
+性能数字依赖 GPU、dtype、shape 和 cuDNN 算法，应在目标模型上复测。
 
 ## BibTeX
 

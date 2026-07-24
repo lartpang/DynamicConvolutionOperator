@@ -1,11 +1,17 @@
+from __future__ import annotations
+
 import argparse
 import itertools
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-import tabulate
 import torch
 from torch import nn
+
+try:
+    import tabulate
+except ImportError:
+    tabulate = None
 
 # 引入两个已实现的模块
 from triton_impl import DDPM as _DDPM_Triton
@@ -18,16 +24,36 @@ _REGISTRY: dict[str, type[nn.Module]] = {
 
 
 def list_impls() -> list[str]:
-    return sorted(_REGISTRY.keys())
+    return list(_REGISTRY.keys())
 
 
 def get_impl(name: str) -> type[nn.Module]:
     return _REGISTRY[name]
 
 
+def format_table(rows, headers):
+    if tabulate is not None:
+        return tabulate.tabulate(rows, headers=headers, tablefmt="pipe")
+    string_rows = [[str(value) for value in row] for row in rows]
+    widths = [
+        max(len(str(header)), *(len(row[index]) for row in string_rows))
+        for index, header in enumerate(headers)
+    ]
+    lines = [
+        " | ".join(str(header).ljust(widths[index]) for index, header in enumerate(headers)),
+        "-+-".join("-" * width for width in widths),
+    ]
+    lines.extend(
+        " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+        for row in string_rows
+    )
+    return "\n".join(lines)
+
+
 @dataclass
 class BenchmarkResult:
     impl_name: str
+    kernel_size: int
     dim: int
     resolution: int
     batch_size: int
@@ -49,7 +75,18 @@ def create_inputs(batch: int, dim: int, resolution: int, device: str, seed: int)
 
 
 def run_benchmark(
-    model, x, y, impl_name, dim, res, batch, amp_str, warmup=10, repeats=50, test_backward=False
+    model,
+    x,
+    y,
+    impl_name,
+    kernel_size,
+    dim,
+    res,
+    batch,
+    amp_str,
+    warmup=10,
+    repeats=50,
+    test_backward=False,
 ) -> BenchmarkResult:
     use_cuda = x.is_cuda
 
@@ -60,13 +97,24 @@ def run_benchmark(
         amp_dtype = torch.bfloat16
 
     if amp_dtype is not None:
-        amp_ctx = torch.autocast("cuda", dtype=amp_dtype)
-        scaler = torch.cuda.amp.GradScaler(init_scale=1024.0) if amp_dtype == torch.float16 and test_backward else None
+        amp_ctx = torch.autocast(x.device.type, dtype=amp_dtype)
+        scaler = (
+            torch.cuda.amp.GradScaler(init_scale=1024.0)
+            if use_cuda and amp_dtype == torch.float16 and test_backward
+            else None
+        )
     else:
         amp_ctx = nullcontext()
         scaler = None
 
-    result = BenchmarkResult(impl_name=impl_name, dim=dim, resolution=res, batch_size=batch, amp=amp_str)
+    result = BenchmarkResult(
+        impl_name=impl_name,
+        kernel_size=kernel_size,
+        dim=dim,
+        resolution=res,
+        batch_size=batch,
+        amp=amp_str,
+    )
 
     # =============== 预热引擎 ===============
     with torch.set_grad_enabled(test_backward):
@@ -147,7 +195,7 @@ def evaluate_alignment(results: list[BenchmarkResult], has_bwd: bool):
             bwd_close = torch.allclose(ref.grad_x_tensor, r.grad_x_tensor, atol=tolerance * 10, rtol=tolerance * 10)
 
         r.is_aligned = out_close and bwd_close
-        r.status_msg = f"✓对齐" if r.is_aligned else f"✗数值悬殊"
+        r.status_msg = "PASS" if r.is_aligned else "FAIL"
 
 
 def parse_args():
@@ -157,7 +205,12 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--backward", action="store_true", help="启用反向传播测速", default=True)  # 默认直接双走
+    parser.add_argument("--batch-size", type=int, nargs="+", default=[1])
+    parser.add_argument("--kernel-size", type=int, nargs="+", default=[3])
+    parser.add_argument("--dim", type=int, nargs="+", default=[64])
+    parser.add_argument("--resolution", type=int, nargs="+", default=[128])
+    parser.add_argument("--amp", nargs="+", choices=["none", "fp16", "bf16"], default=["none"])
+    parser.add_argument("--backward", action="store_true", help="启用反向传播测速")
     return parser.parse_args()
 
 
@@ -167,11 +220,11 @@ def main():
     # 笛卡尔积打包出所有的 Grid Search 配置项：(batch, dim, res, amp)
     configs = list(
         itertools.product(
-            [1, 2, 4],  # batch size
-            [1, 3, 5],  # kernel size
-            [64],  # dim
-            [128, 256],  # resolution
-            ["none", "fp16", "bf16"],  # amp mode
+            args.batch_size,
+            args.kernel_size,
+            args.dim,
+            args.resolution,
+            args.amp,
         )
     )
 
@@ -193,12 +246,26 @@ def main():
             torch.manual_seed(args.seed)
             ImplClass = get_impl(name)
             model = ImplClass(dim=dim, kernel_size=kernel_size).to(args.device)
-            model.eval()
+            model.train(args.backward)
 
-            res_obj = run_benchmark(model, x, y, name, dim, res, batch, amp, args.warmup, args.repeats, args.backward)
+            res_obj = run_benchmark(
+                model,
+                x,
+                y,
+                name,
+                kernel_size,
+                dim,
+                res,
+                batch,
+                amp,
+                args.warmup,
+                args.repeats,
+                args.backward,
+            )
             cfg_results.append(res_obj)
             del model
-            torch.cuda.empty_cache()
+            if args.device.startswith("cuda"):
+                torch.cuda.empty_cache()
 
         # 交叉对比参考对象与最新对象的数学差异
         evaluate_alignment(cfg_results, args.backward)
@@ -209,6 +276,7 @@ def main():
             table_lines.append(
                 [
                     r.batch_size,
+                    r.kernel_size,
                     r.dim,
                     r.resolution,
                     r.amp.ljust(4),
@@ -219,7 +287,7 @@ def main():
                     f"{ref_time / r.mean_time_ms:.2f}x" if r.mean_time_ms > 0 else "N/A",
                 ]
             )
-    print("\n" + tabulate.tabulate(table_lines, headers=header, tablefmt="pipe"))
+    print("\n" + format_table(table_lines, header))
 
 
 if __name__ == "__main__":
