@@ -1,6 +1,6 @@
 # Dynamic Convolution Operator
 
-这是 ECCV 2020 HD²F-Net 中 Dynamic Dilated Pyramid Module（DDPM）的优化实现。
+这是 ECCV 2020 HDFNet 中 Dynamic Dilated Pyramid Module（DDPM）的优化实现。
 `unfold_impl.py` 是数学参考，`triton_impl.py` 是 CPU/CUDA 自适应实现，
 `_triton_kernels.py` 包含 Triton kernel。
 
